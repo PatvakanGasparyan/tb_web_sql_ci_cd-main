@@ -1,0 +1,161 @@
+name: Deploy to EC2
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-ec2-${{ github.repository }}
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            # ── Install Docker + Compose plugin (Ubuntu or Amazon Linux) ──
+            install_docker_compose_plugin() {
+              local arch
+              arch="$(uname -m)"
+              case "$arch" in
+                x86_64)  COMPOSE_ARCH="x86_64" ;;
+                aarch64) COMPOSE_ARCH="aarch64" ;;
+                *) echo "Unsupported arch: $arch"; exit 1 ;;
+              esac
+              sudo mkdir -p /usr/local/lib/docker/cli-plugins
+              COMPOSE_VER="v2.29.7"
+              sudo curl -fsSL "https://github.com/docker/compose/releases/download/${COMPOSE_VER}/docker-compose-linux-${COMPOSE_ARCH}" \
+                -o /usr/local/lib/docker/cli-plugins/docker-compose
+              sudo chmod +x /usr/local/lib/docker/cli-plugins/docker-compose
+            }
+
+            if ! command -v docker >/dev/null 2>&1; then
+              echo "Installing Docker..."
+              if [ -f /etc/os-release ]; then
+                # shellcheck source=/dev/null
+                . /etc/os-release
+              else
+                echo "Cannot detect OS"; exit 1
+              fi
+
+              case "${ID:-}" in
+                ubuntu|debian)
+                  sudo apt-get update -y
+                  sudo apt-get install -y ca-certificates curl gnupg lsb-release
+                  sudo install -m 0755 -d /etc/apt/keyrings
+                  curl -fsSL "https://download.docker.com/linux/${ID}/gpg" | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+                  sudo chmod a+r /etc/apt/keyrings/docker.gpg
+                  echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/${ID} $(lsb_release -cs) stable" | sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+                  sudo apt-get update -y
+                  sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+                  ;;
+                amzn)
+                  # Amazon Linux 2023 uses dnf; Amazon Linux 2 uses yum + amazon-linux-extras
+                  if [ "${VERSION_ID:-}" = "2023" ]; then
+                    sudo dnf install -y docker
+                  else
+                    sudo yum update -y
+                    sudo amazon-linux-extras install docker -y
+                    if ! docker compose version >/dev/null 2>&1; then
+                      install_docker_compose_plugin
+                    fi
+                  fi
+                  sudo systemctl enable docker
+                  sudo systemctl start docker
+                  ;;
+                *)
+                  echo "Unsupported OS: ${ID:-unknown}. Use Ubuntu, Debian, or Amazon Linux on EC2."
+                  exit 1
+                  ;;
+              esac
+
+              if [ "${ID:-}" = "ubuntu" ] || [ "${ID:-}" = "debian" ]; then
+                sudo systemctl enable docker
+                sudo systemctl start docker
+              fi
+              sudo usermod -aG docker "${USER}" || true
+            fi
+
+            if ! docker compose version >/dev/null 2>&1; then
+              echo "Installing Docker Compose plugin..."
+              install_docker_compose_plugin
+            fi
+
+            sudo systemctl start docker || true
+
+            # ── App directory (must match clone target) ──
+            APP_DIR="${HOME}/tb_web_sql_ci_cd"
+            REPO_URL="https://github.com/${{ github.repository }}.git"
+
+            # Optional: set secret GIT_PAT for private repos (classic PAT or fine-grained with repo read)
+            if [ -n "${{ secrets.GIT_PAT }}" ]; then
+              REPO_URL="https://x-access-token:${{ secrets.GIT_PAT }}@github.com/${{ github.repository }}.git"
+            fi
+
+            # ── Clone or update repository ──
+            if [ -d "${APP_DIR}/.git" ]; then
+              echo "Pulling latest changes..."
+              cd "${APP_DIR}"
+              git remote set-url origin "${REPO_URL}"
+              git fetch --all --prune
+              git reset --hard "origin/main"
+            else
+              echo "Cloning repository..."
+              git clone "${REPO_URL}" "${APP_DIR}"
+              cd "${APP_DIR}"
+            fi
+
+            # ── Environment from GitHub secrets ──
+            {
+              echo "DB_HOST=mysql"
+              echo "DB_USER=${{ secrets.DB_USER }}"
+              echo "DB_PASSWORD=${{ secrets.DB_PASSWORD }}"
+              echo "DB_NAME=${{ secrets.DB_NAME }}"
+              echo "BOT_TOKEN=${{ secrets.BOT_TOKEN }}"
+            } > "${APP_DIR}/.env"
+
+            echo "=== .env keys (values masked) ==="
+            sed 's/=.*/=***/' "${APP_DIR}/.env"
+
+            cd "${APP_DIR}"
+
+            # ── Stop old containers, keep named volumes (MySQL data) ──
+            sudo docker compose down --remove-orphans || true
+
+            # ── Rebuild images and start fresh containers ──
+            sudo docker compose up --build -d
+
+            echo "Waiting for MySQL health..."
+            for i in $(seq 1 36); do
+              MYSQL_ID="$(sudo docker compose ps -q mysql 2>/dev/null || true)"
+              if [ -n "${MYSQL_ID}" ]; then
+                STATUS="$(sudo docker inspect --format='{{if .State.Health}}{{.State.Health.Status}}{{else}}nohealth{{end}}' "${MYSQL_ID}" 2>/dev/null || echo "unknown")"
+                echo "  ${i}/36: mysql health = ${STATUS}"
+                if [ "${STATUS}" = "healthy" ]; then
+                  echo "MySQL is healthy."
+                  break
+                fi
+              fi
+              if [ "${i}" -eq 36 ]; then
+                echo "MySQL did not become healthy in time. Logs:"
+                sudo docker compose logs mysql --tail 80
+                exit 1
+              fi
+              sleep 5
+            done
+
+            sudo docker compose ps
+            sudo docker image prune -f
+
+            echo "Deployment complete."
