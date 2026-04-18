@@ -72,7 +72,7 @@ jobs:
             # ── Wait for MySQL to be healthy ──
             echo "Waiting for MySQL to become healthy..."
             for i in $(seq 1 30); do
-              STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' tb_web_sql_ci_cd_main-mysql-1 2>/dev/null || echo "not_found")
+              STATUS=$(sudo docker inspect --format='{{.State.Health.Status}}' tb_web_sql_ci_cd-main-mysql-1 2>/dev/null || echo "not_found")
               echo "  Attempt $i/30: MySQL status = $STATUS"
               if [ "$STATUS" = "healthy" ]; then
                 echo "MySQL is healthy!"
@@ -80,7 +80,7 @@ jobs:
               fi
               if [ "$i" = "30" ]; then
                 echo "MySQL failed to become healthy. Container logs:"
-                sudo docker logs tb_web_sql_ci_cd_main-mysql-1 --tail 50
+                sudo docker logs tb_web_sql_ci_cd-main-mysql-1 --tail 50
                 exit 1
               fi
               sleep 5
